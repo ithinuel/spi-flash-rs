@@ -10,8 +10,8 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use either::Either;
 
-use core::convert::TryInto;
 use core::time::Duration;
 #[cfg(feature = "std")]
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,6 +23,9 @@ pub mod id;
 pub mod sfdp;
 pub mod sreg;
 
+mod commands;
+pub use commands::{spansion::Command, Address24Bits};
+
 pub use id::FlashID;
 pub use sfdp::{FlashParams, SFDPAddressBytes, SFDPEraseInst, SFDPStatus1Volatility, SFDPTiming};
 pub use sreg::{StatusRegister1, StatusRegister2, StatusRegister3};
@@ -30,7 +33,8 @@ pub use sreg::{StatusRegister1, StatusRegister2, StatusRegister3};
 use erase_plan::ErasePlan;
 use sfdp::SFDPHeader;
 
-#[cfg_attr(feature = "std", derive(thiserror::Error, Debug))]
+#[cfg_attr(feature = "std", derive(thiserror::Error))]
+#[derive(Debug)]
 pub enum Error {
     #[cfg_attr(feature = "std", error("Mismatch during flash readback verification."))]
     ReadbackError { address: u32, wrote: u8, read: u8 },
@@ -81,16 +85,21 @@ pub trait FlashAccess {
     type Error;
 
     /// Assert CS, write all bytes in `data` to the SPI bus, then de-assert CS.
-    fn write(&mut self, data: &[u8]) -> core::result::Result<(), Self::Error> {
+    fn write(&mut self, command: Command, data: &[u8]) -> core::result::Result<(), Self::Error> {
         // Default implementation uses `exchange()` and ignores the result data.
-        self.exchange(data)?;
+        self.exchange(command, data, 0)?;
         Ok(())
     }
 
     /// Assert CS, write all bytes in `data` while capturing received data, then de-assert CS.
     ///
     /// Returns the received data.
-    fn exchange(&mut self, data: &[u8]) -> core::result::Result<Vec<u8>, Self::Error>;
+    fn exchange(
+        &mut self,
+        command: Command,
+        data: &[u8],
+        nbytes: usize,
+    ) -> core::result::Result<Vec<u8>, Self::Error>;
 
     /// Wait for at least `duration`.
     ///
@@ -379,10 +388,7 @@ where
     /// try using `legacy_read()` instead.
     pub fn read(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
         self.check_address_length(address, length)?;
-        let mut param = self.make_address(address);
-        // Dummy byte after address.
-        param.push(0);
-        self.exchange(Command::FastRead, &param, length)
+        self.exchange(Command::FastRead(Address24Bits(address)), &[], length)
     }
 
     /// Read `length` bytes of data from the attached flash, starting at `address`.
@@ -392,8 +398,7 @@ where
     /// and may be faster for very short reads as it does not require a dummy byte.
     pub fn legacy_read(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
         self.check_address_length(address, length)?;
-        let param = self.make_address(address);
-        self.exchange(Command::ReadData, &param, length)
+        self.exchange(Command::ReadData(Address24Bits(address)), &[], length)
     }
 
     /// Read `length` bytes of data from the attached flash, starting at `address`.
@@ -412,9 +417,11 @@ where
         cb(0);
         for addr in (start..end).step_by(chunk_size) {
             let size = usize::min(chunk_size, end - addr);
-            let mut param = self.make_address(addr as u32);
-            param.push(0);
-            data.append(&mut self.exchange(Command::FastRead, &param, size)?);
+            data.append(&mut self.exchange(
+                Command::FastRead(Address24Bits(addr as u32)),
+                &[0], // 1 dummy bytes
+                size,
+            )?);
             cb(data.len());
         }
         cb(data.len());
@@ -584,7 +591,7 @@ where
             self.command(Command::EnableReset)?;
             self.command(Command::Reset)
         } else if do_f0 {
-            self.command(0xF0)
+            self.command(Command::try_from_byte(0xF0, None)?)
         } else {
             log::error!("No reset instruction available.");
             Err(Error::NoResetInstruction)
@@ -767,10 +774,8 @@ where
     /// Note that this does *not* erase the flash beforehand;
     /// use `program()` for a higher-level erase-program-verify interface.
     pub fn page_program(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        let mut tx = self.make_address(address);
-        tx.extend(data);
         self.write_enable()?;
-        self.exchange(Command::PageProgram, &tx, 0)?;
+        self.exchange(Command::PageProgram(Address24Bits(address)), &data, 0)?;
         if let Some(params) = self.params {
             if let Some(timing) = params.timing {
                 // Only bother sleeping if the expected programming time is greater than 1ms,
@@ -881,21 +886,21 @@ where
     fn write_status1(&mut self, status1: StatusRegister1) -> Result<()> {
         let we_opcode = if let Some(params) = self.params {
             match params.status_1_vol {
-                Some(SFDPStatus1Volatility::NonVolatile06) => 0x06,
-                Some(SFDPStatus1Volatility::Volatile06) => 0x06,
-                Some(SFDPStatus1Volatility::Volatile50) => 0x50,
-                Some(SFDPStatus1Volatility::NonVolatile06Volatile50) => 0x06,
-                Some(SFDPStatus1Volatility::Mixed06) => 0x06,
+                Some(SFDPStatus1Volatility::NonVolatile06) => Command::WriteEnable,
+                Some(SFDPStatus1Volatility::Volatile06) => Command::WriteEnable,
+                Some(SFDPStatus1Volatility::Volatile50) => Command::WriteEnableVolatile,
+                Some(SFDPStatus1Volatility::NonVolatile06Volatile50) => Command::WriteEnable,
+                Some(SFDPStatus1Volatility::Mixed06) => Command::WriteEnable,
                 _ => {
                     if params.legacy_block_protect_volatile {
-                        params.legacy_volatile_write_en_inst
+                        Command::try_from_byte(params.legacy_volatile_write_en_inst, None)?
                     } else {
-                        Command::WriteEnable.into()
+                        Command::WriteEnable
                     }
                 }
             }
         } else {
-            Command::WriteEnable.into()
+            Command::WriteEnable
         };
         self.command(we_opcode)?;
         let s1 = self.read_status1()?;
@@ -949,38 +954,32 @@ where
     ///
     /// `addr` is always sent as a 24-bit address, regardless of the address_bytes setting.
     pub fn read_sfdp(&mut self, addr: u32, len: usize) -> Result<Vec<u8>> {
-        let bytes = addr.to_be_bytes();
-        self.exchange(Command::ReadSFDPRegister, &bytes[1..], 1 + len)
+        self.exchange(Command::ReadSFDPRegister(Address24Bits(addr)), &[], 1 + len)
             .map(|data| data[1..].to_vec())
     }
 
     /// Writes `command` and `data` to the flash memory, then returns `nbytes` of response.
-    pub fn exchange<C: Into<u8>>(
-        &mut self,
-        command: C,
-        data: &[u8],
-        nbytes: usize,
-    ) -> Result<Vec<u8>> {
-        let mut tx = alloc::vec![command.into()];
-        tx.extend(data);
-        log::trace!("SPI exchange: write {:02X?}, read {} bytes", &tx, nbytes);
-        tx.extend(alloc::vec![0u8; nbytes]);
-        let rx = self.access.exchange(&tx)?;
+    pub fn exchange(&mut self, command: Command, data: &[u8], nbytes: usize) -> Result<Vec<u8>> {
+        log::trace!(
+            "SPI exchange: write {:?} {:02X?}, read {} bytes",
+            command,
+            &data,
+            nbytes
+        );
+        let rx = self.access.exchange(command, data, nbytes)?;
         log::trace!("SPI exchange: read {:02X?}", &rx[1 + data.len()..]);
         Ok(rx[1 + data.len()..].to_vec())
     }
 
     /// Writes `command` and `data` to the flash memory, without reading the response.
-    pub fn write<C: Into<u8>>(&mut self, command: C, data: &[u8]) -> Result<()> {
-        let mut tx = alloc::vec![command.into()];
-        tx.extend(data);
-        log::trace!("SPI write: {:02X?}", &tx);
-        self.access.write(&tx)?;
+    pub fn write(&mut self, command: Command, data: &[u8]) -> Result<()> {
+        log::trace!("SPI write: {:?} {:02X?}", command, data);
+        self.access.write(command, data)?;
         Ok(())
     }
 
     /// Convenience method for issuing a single command and not caring about the returned data
-    pub fn command<C: Into<u8>>(&mut self, command: C) -> Result<()> {
+    pub fn command(&mut self, command: Command) -> Result<()> {
         self.write(command, &[])?;
         Ok(())
     }
@@ -1017,14 +1016,6 @@ where
                 _ => Ok(()),
             }
         }
-    }
-
-    /// Generate a 1-, 2-, 3-, or 4-byte address, depending on current `address_bytes` setting.
-    ///
-    /// Panics if address_bytes is not 1-, 2, 3, or 4.
-    fn make_address(&self, addr: u32) -> Vec<u8> {
-        let bytes = addr.to_be_bytes();
-        bytes[(4 - self.address_bytes as usize)..].to_vec()
     }
 
     /// Work out what combination of erase operations to run to efficiently
@@ -1136,9 +1127,11 @@ where
                 size,
                 base
             );
-            let addr = self.make_address(*base);
             self.write_enable()?;
-            self.write(*opcode, &addr)?;
+            self.write(
+                Command::try_from_byte(*opcode, Some(Either::Left(Address24Bits(*base))))?,
+                &[],
+            )?;
             if let Some(duration) = duration {
                 self.access.delay(*duration / 2);
             }
@@ -1201,67 +1194,4 @@ where
             None => Ok(()),
         }
     }
-}
-
-/// Standard SPI flash command opcodes.
-///
-/// These are taken from the Winbond W25Q16JV datasheet, but most are
-/// widely applicable. If SFDP is supported, it is used to discover
-/// the relevant erase opcodes and sizes.
-///
-/// Only single I/O commands are listed.
-#[derive(Copy, Clone, Debug, num_enum::IntoPrimitive)]
-#[allow(unused)]
-#[repr(u8)]
-enum Command {
-    // Core instruction set.
-    // These commands are almost universally available.
-    WriteEnable = 0x06,
-    WriteDisable = 0x04,
-    ReadData = 0x03,
-    PageProgram = 0x02,
-    ReadStatusRegister1 = 0x05,
-    WriteStatusRegister1 = 0x01,
-
-    // Standard instruction set.
-    // These commands are typically available.
-    ReadJEDECID = 0x9F,
-    FastRead = 0x0B,
-    Powerdown = 0xB9,
-    ReleasePowerdown = 0xAB,
-    ReadDeviceID = 0x90,
-    ChipErase = 0xC7,
-
-    // Extended instruction set.
-    // These commands may be available.
-    ReadUniqueID = 0x4B,
-    ReadSFDPRegister = 0x5A,
-    ReadStatusRegister2 = 0x35,
-    ReadStatusRegister3 = 0x15,
-    ReadFlagStatusRegister = 0x70,
-    WriteStatusRegister2 = 0x31,
-    WriteStatusRegister3 = 0x11,
-    WriteEnableVolatile = 0x50,
-    EnableReset = 0x66,
-    Reset = 0x99,
-    ProgramSuspend = 0x75,
-    ProgramResume = 0x7A,
-
-    // Erase instructions.
-    // The size affected by each erase operation can vary.
-    // Typical sizes are 4kB for sector erase, 32kB for block erase 1,
-    // and 64kB for block erase 2.
-    SectorErase = 0x20,
-    BlockErase1 = 0x52,
-    BlockErase2 = 0xD8,
-
-    // Security/lock related instructions.
-    EraseSecurityRegisters = 0x44,
-    ProgramSecurityRegisters = 0x42,
-    ReadSecurityRegisters = 0x48,
-    IndividualBlockLock = 0x36,
-    IndividualBlockUnlock = 0x39,
-    ReadBlockLock = 0x3D,
-    GlobalBlockLock = 0x7E,
-    GlobalBlockUnlock = 0x98,
 }

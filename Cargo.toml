@@ -2,7 +2,7 @@
 name = "spi-flash"
 version = "0.3.0"
 authors = ["Adam Greig <adam@adamgreig.com>"]
-edition = "2018"
+edition = "2021"
 repository = "https://github.com/adamgreig/spi-flash-rs"
 license = "Apache-2.0 OR MIT"
 description = "SPI flash memory interface crate"
@@ -14,6 +14,8 @@ jep106 = { version = "0.2.6", optional = true }
 anyhow = { version = "1.0.58", optional = true }
 thiserror = { version = "1.0.31", optional = true }
 indicatif = { version = "0.17.0", optional = true }
+arrayvec = "*"
+either = "*"
 
 [features]
 default = ["std"]
